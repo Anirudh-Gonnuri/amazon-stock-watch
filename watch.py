@@ -238,7 +238,7 @@ $appId = '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\pow
     return True
 
 
-def notify_ntfy(title: str, body: str, url: str | None) -> bool:
+def notify_ntfy(title: str, body: str, url: str | None, priority: str = "urgent") -> bool:
     """Push to a phone via ntfy.sh.
 
     The topic name acts as the password for the channel, so it comes from the
@@ -251,7 +251,8 @@ def notify_ntfy(title: str, body: str, url: str | None) -> bool:
     if not topic:
         return False
     server = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
-    headers = {"Title": title.encode("utf-8"), "Priority": "urgent", "Tags": "rotating_light"}
+    headers = {"Title": title.encode("utf-8"), "Priority": priority,
+               "Tags": "rotating_light" if priority == "urgent" else "white_check_mark"}
     if url:
         headers["Click"] = url
     req = urllib.request.Request(
@@ -296,6 +297,7 @@ def run(args: argparse.Namespace) -> int:
         result = check(args.host, args.listing, args.match)
     except Blocked as e:
         state["blocked_streak"] = state.get("blocked_streak", 0) + 1
+        state["blocked_since_heartbeat"] = state.get("blocked_since_heartbeat", 0) + 1
         log.warning("blocked (%d in a row): %s", state["blocked_streak"], e)
 
         # A redesign won't fix itself, so it alerts sooner (2 runs in a row,
@@ -319,6 +321,8 @@ def run(args: argparse.Namespace) -> int:
         log.info("page readable again after %d blocked runs", state["blocked_streak"])
     state["blocked_streak"] = 0
     state["layout_streak"] = 0
+    state["ok_since_heartbeat"] = state.get("ok_since_heartbeat", 0) + 1
+    state["last_ok"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
     previous = state.get("status")
     log.info("status=%s asin=%s price=%s detail=%s",
@@ -342,7 +346,19 @@ def run(args: argparse.Namespace) -> int:
 
 
 def finish(args: argparse.Namespace, state: dict) -> None:
-    """Persist state at the end of a run."""
+    """Send the daily heartbeat if requested, then persist state."""
+    if args.heartbeat:
+        ok = state.get("ok_since_heartbeat", 0)
+        blocked = state.get("blocked_since_heartbeat", 0)
+        status = {"not_listed": "not listed yet", "out_of_stock": "listed, not buyable",
+                  "in_stock": "IN STOCK"}.get(state.get("status"), "unknown")
+        notify_ntfy(  # phone only: this is a quiet daily signal, not an alert
+            "Amazon watcher: still running",
+            f"{' '.join(args.match)}: {status}. Since last heartbeat: {ok} checks ok, "
+            f"{blocked} blocked. Last good check {state.get('last_ok', 'never')}.",
+            None, priority="low")
+        log.info("heartbeat sent (%d ok, %d blocked)", ok, blocked)
+        state["ok_since_heartbeat"] = state["blocked_since_heartbeat"] = 0
     save_state(state)
 
 
@@ -355,6 +371,8 @@ def main() -> int:
                    help="terms that must all appear in the variant's labels")
     p.add_argument("--jitter", type=int, default=0,
                    help="sleep a random 0..N seconds first, so checks aren't clockwork")
+    p.add_argument("--heartbeat", action="store_true",
+                   help="after checking, push a low-priority 'still running' summary")
     p.add_argument("--test-notify", action="store_true",
                    help="send a test notification and exit")
     args = p.parse_args()

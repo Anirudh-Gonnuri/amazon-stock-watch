@@ -106,5 +106,20 @@ class Alerts(unittest.TestCase):
         self.assertEqual(self.run_with(watch.LayoutChanged("no title")), [])
 
 
+    def test_heartbeat_summarises_and_resets_counters(self):
+        result = watch.Result("not_listed")
+        self.run_with(result, times=2)
+        self.run_with(watch.Blocked("CAPTCHA"))
+        self.args.heartbeat = True
+        with mock.patch.object(watch, "check", return_value=result), \
+             mock.patch.object(watch, "notify_ntfy") as push:
+            watch.run(self.args)
+        body = push.call_args.args[1]
+        self.assertIn("3 checks ok, 1 blocked", body)
+        self.assertEqual(push.call_args.kwargs["priority"], "low")
+        state = watch.load_state()
+        self.assertEqual((state["ok_since_heartbeat"], state["blocked_since_heartbeat"]), (0, 0))
+
+
 if __name__ == "__main__":
     unittest.main()
