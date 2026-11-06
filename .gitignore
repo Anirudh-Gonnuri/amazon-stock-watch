@@ -3,3 +3,6 @@ state.json
 state.tmp
 watch.log
 __pycache__/
+
+# Private ntfy channel name (acts as its password)
+ntfy_topic.txt
