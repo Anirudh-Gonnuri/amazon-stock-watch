@@ -120,6 +120,39 @@ class FlipkartParsing(unittest.TestCase):
             watch.parse_flipkart_product(page)
 
 
+class StockAndPriceRule(unittest.TestCase):
+    rule = staticmethod(watch.stock_and_price_result)
+
+    def test_no_max_price_means_alert_when_in_stock(self):
+        r = self.rule("x", 50000, True, None, URL)
+        self.assertEqual((r.status, r.good, r.status_text), ("in_stock", True, "in stock"))
+
+    def test_sold_out_is_never_good(self):
+        self.assertFalse(self.rule("x", 1, False, 99999, URL).good)
+        self.assertFalse(self.rule("x", 1, False, None, URL).good)
+
+    def test_missing_price_never_counts_as_at_target(self):
+        r = self.rule("x", None, True, 99999, URL)
+        self.assertEqual((r.status, r.good), ("above_target", False))
+
+    def test_amazon_product_mode_uses_the_rule(self):
+        page = ('<span id="productTitle"> Phone </span><span class="a-price-whole">95,000'
+                '</span><div id="availability"> In stock </div><div id="add-to-cart-button">')
+        with mock.patch.object(watch, "fetch", return_value=page):
+            r = watch.check_amazon_product("www.amazon.in", "B0X", 99999)
+        self.assertEqual((r.status, r.price, r.url),
+                         ("at_target", 95000, "https://www.amazon.in/dp/B0X?th=1&psc=1"))
+
+    def test_build_target_picks_amazon_mode_by_keys(self):
+        entry = {"key": "a", "site": "amazon", "label": "x", "host": "www.amazon.in"}
+        with mock.patch.object(watch, "check_amazon_product") as product, \
+             mock.patch.object(watch, "check_amazon") as variant:
+            watch.build_target({**entry, "asin": "B0X"}).check()
+            watch.build_target({**entry, "listing": "B0Y", "match": ["z"]}).check()
+        product.assert_called_once_with("www.amazon.in", "B0X", None)
+        variant.assert_called_once_with("www.amazon.in", "B0Y", ["z"])
+
+
 class Formatting(unittest.TestCase):
     def test_indian_digit_grouping(self):
         cases = {999: "₹999", 1000: "₹1,000", 109999: "₹1,09,999", 12345678: "₹1,23,45,678"}

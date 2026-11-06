@@ -6,12 +6,14 @@ scheduler (Windows Task Scheduler, cron, GitHub Actions, ...) is responsible
 for running it repeatedly.
 
 Supported sites:
-  amazon   Wait for a specific variant to appear on a listing and be buyable.
+  amazon   With `asin`: a product page, alerting when it's buyable and (if
+           `max_price` is set) at or under that price.
+           With `listing` + `match`: wait for a variant to appear and be buyable.
            Reads the listing's variant table (`dimensionValuesDisplayData`),
            finds the variant whose labels contain every `match` term, then
            checks that variant's page for an Add to Cart button.
-  flipkart Wait for a product page's price to drop to `max_price` or below
-           while in stock. Reads the page's schema.org Product data, the
+  flipkart A product page, alerting when it's in stock and (if `max_price` is
+           set) at or under that price. Reads the page's schema.org Product data, the
            structured block Flipkart publishes for search engines, rather
            than its visual layout, which changes far more often.
 
@@ -213,7 +215,36 @@ def parse_amazon_product(page: str) -> tuple[str, int | None, bool, str]:
     return title, price, buyable, availability
 
 
+def stock_and_price_result(title: str, price: int | None, in_stock: bool,
+                           max_price: int | None, url: str) -> Result:
+    """Shared rule for 'buy when in stock (and at or under max_price, if given)'."""
+    if not in_stock:
+        return Result("out_of_stock", good=False, status_text="sold out",
+                      title=title, price=price, url=url)
+    if max_price is None:
+        return Result("in_stock", good=True, status_text="in stock",
+                      title=title, price=price, url=url)
+    target = format_inr(max_price)
+    if price is not None and price <= max_price:
+        return Result("at_target", good=True,
+                      status_text=f"at {format_inr(price)} (target {target})",
+                      title=title, price=price, url=url)
+    # No visible price counts as "not at target": never alert on a guess.
+    return Result("above_target", good=False, status_text=f"above your {target} target",
+                  title=title, price=price, url=url)
+
+
+def check_amazon_product(host: str, asin: str, max_price: int | None) -> Result:
+    """A specific product page: alert when buyable (and at or under max_price)."""
+    url = f"https://{host}/dp/{asin}?th=1&psc=1"
+    title, price, buyable, availability = parse_amazon_product(fetch(url, AMAZON_MARKER))
+    result = stock_and_price_result(title, price, buyable, max_price, url)
+    result.detail = availability or None
+    return result
+
+
 def check_amazon(host: str, listing: str, match: list[str]) -> Result:
+    """A variant that may not be listed yet: alert when it appears and is buyable."""
     listing_page = fetch(f"https://{host}/dp/{listing}?th=1", AMAZON_MARKER)
     variants = parse_variants(listing_page)
     asin = find_variant(variants, match)
@@ -259,18 +290,9 @@ def parse_flipkart_product(page: str) -> tuple[str, int, bool]:
     raise LayoutChanged("no schema.org Product data on the page")
 
 
-def check_flipkart(url: str, max_price: int) -> Result:
+def check_flipkart(url: str, max_price: int | None) -> Result:
     name, price, in_stock = parse_flipkart_product(fetch(url, FLIPKART_MARKER))
-    target = format_inr(max_price)
-    if not in_stock:
-        return Result("out_of_stock", good=False, status_text="sold out",
-                      title=name, price=price, url=url)
-    if price <= max_price:
-        return Result("at_target", good=True,
-                      status_text=f"at {format_inr(price)} (target {target})",
-                      title=name, price=price, url=url)
-    return Result("above_target", good=False, status_text=f"above your {target} target",
-                  title=name, price=price, url=url)
+    return stock_and_price_result(name, price, in_stock, max_price, url)
 
 
 # --------------------------------------------------------------------------- #
@@ -282,13 +304,19 @@ SITES = {"amazon": "Amazon", "flipkart": "Flipkart"}
 
 def build_target(entry: dict) -> Target:
     site = entry["site"]
-    if site == "amazon":
+    max_price = int(entry["max_price"]) if entry.get("max_price") is not None else None
+    if site == "amazon" and "asin" in entry:
+        host, asin = entry["host"], entry["asin"]
+
+        def check() -> Result:
+            return check_amazon_product(host, asin, max_price)
+    elif site == "amazon":
         host, listing, match = entry["host"], entry["listing"], entry["match"]
 
         def check() -> Result:
             return check_amazon(host, listing, match)
     elif site == "flipkart":
-        url, max_price = entry["url"], int(entry["max_price"])
+        url = entry["url"]
 
         def check() -> Result:
             return check_flipkart(url, max_price)
