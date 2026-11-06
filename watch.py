@@ -215,7 +215,7 @@ def notify_ntfy(title: str, body: str, url: str | None) -> bool:
     if not topic:
         return False
     server = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
-    headers = {"Title": title.encode("utf-8"), "Priority": "urgent", "Tags": "iphone"}
+    headers = {"Title": title.encode("utf-8"), "Priority": "urgent", "Tags": "rotating_light"}
     if url:
         headers["Click"] = url
     req = urllib.request.Request(
