@@ -1,0 +1,58 @@
+name: watch
+
+on:
+  # GitHub only runs schedules from the default branch, and often runs them
+  # 5-20 minutes late under load. The local Task Scheduler job covers the gap.
+  schedule:
+    - cron: "*/10 * * * *"
+  # Manual "Run workflow" button in the Actions tab.
+  workflow_dispatch:
+  # Run a check whenever the watcher itself changes, on any branch.
+  push:
+    paths:
+      - watch.py
+      - .github/workflows/watch.yml
+
+# Never let two checks overlap; they'd race on the saved state.
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # state.json remembers what was already reported, so each event alerts
+      # once. Runners start empty, so it's carried between runs in the cache:
+      # restore the newest copy, then save a fresh one under this run's ID.
+      - name: Restore previous state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: watch-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: watch-state-
+
+      - name: Check Amazon
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          # Exit code 2 means Amazon blocked this run. That's expected now and
+          # then, so flag it without failing the job (failures email you).
+          # watch.py itself pushes a warning after 6 blocked runs in a row.
+          python3 watch.py || {
+            code=$?
+            if [ "$code" -eq 2 ]; then echo "::warning::Amazon blocked this check"; else exit "$code"; fi
+          }
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: watch-state-${{ github.run_id }}-${{ github.run_attempt }}
