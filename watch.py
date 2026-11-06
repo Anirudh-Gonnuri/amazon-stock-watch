@@ -10,6 +10,10 @@ Supported sites:
            Reads the listing's variant table (`dimensionValuesDisplayData`),
            finds the variant whose labels contain every `match` term, then
            checks that variant's page for an Add to Cart button.
+  flipkart Wait for a product page's price to drop to `max_price` or below
+           while in stock. Reads the page's schema.org Product data, the
+           structured block Flipkart publishes for search engines, rather
+           than its visual layout, which changes far more often.
 
 Each target remembers its last status in state.json and alerts only when the
 status changes, so you get one alert per event rather than one every run.
@@ -227,10 +231,53 @@ def check_amazon(host: str, listing: str, match: list[str]) -> Result:
 
 
 # --------------------------------------------------------------------------- #
+# Flipkart
+# --------------------------------------------------------------------------- #
+
+FLIPKART_MARKER = "application/ld+json"
+
+
+def parse_flipkart_product(page: str) -> tuple[str, int, bool]:
+    """Return (name, price in rupees, in stock) from the schema.org Product block."""
+    blocks = re.findall(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+                        page, re.S)
+    for block in blocks:
+        try:
+            data = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        for item in data if isinstance(data, list) else [data]:
+            if not (isinstance(item, dict) and item.get("@type") == "Product"):
+                continue
+            offers = item.get("offers") or {}
+            if isinstance(offers, list):
+                offers = offers[0] if offers else {}
+            if offers.get("price") is None:
+                raise LayoutChanged("schema.org Product has no offers.price")
+            in_stock = str(offers.get("availability", "")).endswith("/InStock")
+            return item.get("name", "?"), round(float(offers["price"])), in_stock
+    raise LayoutChanged("no schema.org Product data on the page")
+
+
+def check_flipkart(url: str, max_price: int) -> Result:
+    name, price, in_stock = parse_flipkart_product(fetch(url, FLIPKART_MARKER))
+    target = format_inr(max_price)
+    if not in_stock:
+        return Result("out_of_stock", good=False, status_text="sold out",
+                      title=name, price=price, url=url)
+    if price <= max_price:
+        return Result("at_target", good=True,
+                      status_text=f"at {format_inr(price)} (target {target})",
+                      title=name, price=price, url=url)
+    return Result("above_target", good=False, status_text=f"above your {target} target",
+                  title=name, price=price, url=url)
+
+
+# --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 
-SITES = {"amazon": "Amazon"}
+SITES = {"amazon": "Amazon", "flipkart": "Flipkart"}
 
 
 def build_target(entry: dict) -> Target:
@@ -240,6 +287,11 @@ def build_target(entry: dict) -> Target:
 
         def check() -> Result:
             return check_amazon(host, listing, match)
+    elif site == "flipkart":
+        url, max_price = entry["url"], int(entry["max_price"])
+
+        def check() -> Result:
+            return check_flipkart(url, max_price)
     else:
         raise ValueError(f"unknown site {site!r} in target {entry.get('key')!r}")
     return Target(key=entry["key"], site=SITES[site], label=entry["label"], check=check)

@@ -74,6 +74,52 @@ class AmazonParsing(unittest.TestCase):
         self.assertEqual(watch.parse_amazon_product(page)[1], 109999)
 
 
+def flipkart_page(price, availability="InStock", name="Galaxy S25 Ultra (Whitesilver, 512 GB)"):
+    product = {"@context": "https://schema.org", "@type": "Product", "name": name,
+               "offers": {"price": price, "priceCurrency": "INR",
+                          "availability": f"https://schema.org/{availability}"}}
+    return ('<script type="application/ld+json">{"@type":"BreadcrumbList"}</script>'
+            f'<script type="application/ld+json">{json.dumps(product)}</script>')
+
+
+class FlipkartParsing(unittest.TestCase):
+    URL = "https://www.flipkart.com/x/p/itm1"
+
+    def check(self, page, max_price=109999):
+        with mock.patch.object(watch, "fetch", return_value=page):
+            return watch.check_flipkart(self.URL, max_price)
+
+    def test_reads_product_block_among_other_json_ld(self):
+        name, price, in_stock = watch.parse_flipkart_product(flipkart_page(139999))
+        self.assertEqual((price, in_stock), (139999, True))
+        self.assertIn("Whitesilver", name)
+
+    def test_above_target_is_not_good(self):
+        r = self.check(flipkart_page(139999))
+        self.assertEqual((r.status, r.good), ("above_target", False))
+
+    def test_exactly_at_target_is_good(self):
+        r = self.check(flipkart_page(109999))
+        self.assertEqual((r.status, r.good), ("at_target", True))
+        self.assertEqual(r.status_text, "at ₹1,09,999 (target ₹1,09,999)")
+
+    def test_cheap_but_sold_out_is_not_good(self):
+        r = self.check(flipkart_page(99999, availability="OutOfStock"))
+        self.assertEqual((r.status, r.good), ("out_of_stock", False))
+
+    def test_decimal_and_string_prices(self):
+        self.assertEqual(watch.parse_flipkart_product(flipkart_page("109999.00"))[1], 109999)
+
+    def test_missing_product_block_is_layout_change(self):
+        with self.assertRaises(watch.LayoutChanged):
+            watch.parse_flipkart_product('<script type="application/ld+json">{}</script>')
+
+    def test_missing_price_is_layout_change(self):
+        page = flipkart_page(1).replace('"price": 1, ', "")
+        with self.assertRaises(watch.LayoutChanged):
+            watch.parse_flipkart_product(page)
+
+
 class Formatting(unittest.TestCase):
     def test_indian_digit_grouping(self):
         cases = {999: "₹999", 1000: "₹1,000", 109999: "₹1,09,999", 12345678: "₹1,23,45,678"}
@@ -83,8 +129,13 @@ class Formatting(unittest.TestCase):
 
 class Config(unittest.TestCase):
     def test_shipped_targets_json_loads(self):
-        targets = watch.load_targets()
-        self.assertIn(watch.LEGACY_TARGET_KEY, [t.key for t in targets])
+        targets = {t.key: t for t in watch.load_targets()}
+        self.assertIn(watch.LEGACY_TARGET_KEY, targets)
+        self.assertEqual(targets["flipkart-s25u-whitesilver-512"].site, "Flipkart")
+
+    def test_unknown_site_rejected(self):
+        with self.assertRaises(ValueError):
+            watch.build_target({"key": "a", "site": "ebay", "label": "x"})
 
     def test_duplicate_keys_rejected(self):
         entry = {"key": "a", "site": "amazon", "label": "x", "host": "h",
@@ -158,6 +209,17 @@ class Alerts(unittest.TestCase):
         listed = watch.Result("out_of_stock", good=False,
                               status_text="listed, not buyable yet")
         self.assertEqual(len(self.run_with(make_target(listed))), 1)
+
+    def test_price_drop_to_target_alerts_once_and_rise_alerts_again(self):
+        above = watch.Result("above_target", good=False, status_text="above your target",
+                             price=139999)
+        hit = watch.Result("at_target", good=True, status_text="at ₹1,05,999",
+                           price=105999)
+        self.assertEqual(self.run_with(make_target(above, site="Flipkart"), times=2), [])
+        self.assertEqual(self.run_with(make_target(hit, site="Flipkart"), times=2),
+                         ["Flipkart: S25 Ultra Whitesilver 512GB is at ₹1,05,999!"])
+        self.assertEqual(self.run_with(make_target(above, site="Flipkart")),
+                         ["Flipkart: S25 Ultra Whitesilver 512GB is now above your target"])
 
     def test_ordinary_blocks_alert_once_at_threshold(self):
         alerts = self.run_with(make_target(watch.Blocked("CAPTCHA")),
