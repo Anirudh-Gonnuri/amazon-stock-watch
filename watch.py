@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Watch an Amazon listing for a specific variant to appear and come into stock.
+"""Watch shop listings and alert when a product becomes worth buying.
 
-Each run does one check and exits. A scheduler (Windows Task Scheduler, cron,
-GitHub Actions, ...) is responsible for running it repeatedly.
+Each run checks every product ("target") in targets.json once and exits. A
+scheduler (Windows Task Scheduler, cron, GitHub Actions, ...) is responsible
+for running it repeatedly.
 
-How a check works:
-  1. Fetch the parent listing page and read its variant table
-     (`dimensionValuesDisplayData`), which maps each variant ASIN to its
-     labels, e.g. "B0DSBTKP5Q": ["12GB + 512GB", "...", "Titanium Silverblue"].
-  2. Find a variant whose labels contain every --match term (case-insensitive).
-  3. If one exists, fetch that variant's own page and decide whether it is
-     buyable (has an Add to Cart button and is not "Currently unavailable").
-  4. Compare with the previous run's result (state.json) and notify only on a
-     change, so you get one alert per event rather than one every run.
+Supported sites:
+  amazon   Wait for a specific variant to appear on a listing and be buyable.
+           Reads the listing's variant table (`dimensionValuesDisplayData`),
+           finds the variant whose labels contain every `match` term, then
+           checks that variant's page for an Add to Cart button.
+  flipkart Wait for a product page's price to drop to `max_price` or below
+           while in stock. Reads the page's schema.org Product data, the
+           structured block Flipkart publishes for search engines, rather
+           than its visual layout, which changes far more often.
 
-If Amazon serves a CAPTCHA or a page without the expected markers, the run is
-recorded as "blocked" instead of being misread as "not available". After
-several blocked runs in a row you get a single warning.
+Each target remembers its last status in state.json and alerts only when the
+status changes, so you get one alert per event rather than one every run.
+
+If a site serves a CAPTCHA, a bot check, or a page without the expected
+markers, the run is recorded as "blocked" instead of being misread as "not
+available". Sustained blocks, and pages that look redesigned, send a warning.
 
 Standard library only, so it runs anywhere Python 3.9+ is installed.
 """
@@ -39,18 +43,21 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 from xml.sax.saxutils import escape as xml_escape
 
 HERE = Path(__file__).resolve().parent
+CONFIG_FILE = HERE / "targets.json"
 STATE_FILE = HERE / "state.json"
 LOG_FILE = HERE / "watch.log"
 NTFY_TOPIC_FILE = HERE / "ntfy_topic.txt"  # git-ignored; see notify_ntfy
 
-DEFAULT_HOST = "www.amazon.in"
-DEFAULT_LISTING = "B0DSKL9MQ8"  # Galaxy S25 Ultra listing the user is watching
-DEFAULT_MATCH = ["512GB", "Whitesilver"]
 BLOCKED_ALERT_AFTER = 6  # consecutive blocked runs before warning
 LAYOUT_ALERT_AFTER = 2   # consecutive "page redesigned" runs before warning
+
+# The single-product version kept its state at the top level of state.json;
+# it now lives under this target's key (see migrate_state).
+LEGACY_TARGET_KEY = "amazon-s25u-whitesilver-512"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -61,35 +68,61 @@ log = logging.getLogger("watch")
 
 
 class Blocked(Exception):
-    """Amazon refused the request (CAPTCHA, bot check, error status)."""
+    """The site refused the request (CAPTCHA, bot check, error status)."""
 
 
 class LayoutChanged(Blocked):
-    """The page loaded but the markers we parse are missing: Amazon redesigned it."""
+    """The page loaded but the markers we parse are missing: the site redesigned it."""
 
 
 @dataclass
 class Result:
-    status: str  # "not_listed" | "out_of_stock" | "in_stock"
-    asin: str | None = None
+    status: str          # machine-readable, compared between runs
+    good: bool           # True when this is the state worth alerting about
+    status_text: str     # human wording, e.g. "in stock", "not listed yet"
     title: str | None = None
-    price: str | None = None
+    price: int | None = None  # whole rupees
+    url: str | None = None
     detail: str | None = None
 
 
+@dataclass
+class Target:
+    key: str    # stable id; names this target's entry in state.json
+    site: str   # display name, e.g. "Amazon"
+    label: str  # what is being watched, e.g. "S25 Ultra Whitesilver 512GB"
+    check: Callable[[], Result]
+
+
+def format_inr(rupees: int) -> str:
+    """Indian digit grouping: 109999 -> '₹1,09,999'."""
+    digits = str(rupees)
+    if len(digits) <= 3:
+        return f"₹{digits}"
+    head, tail = digits[:-3], digits[-3:]
+    groups = []
+    while len(head) > 2:
+        groups.insert(0, head[-2:])
+        head = head[:-2]
+    groups.insert(0, head)
+    return "₹" + ",".join(groups + [tail])
+
+
 # --------------------------------------------------------------------------- #
-# Fetching and parsing
+# Fetching
 # --------------------------------------------------------------------------- #
 
-def fetch(url: str, attempts: int = 3) -> str:
-    """Fetch a product page, retrying when Amazon blocks the request.
+def fetch(url: str, marker: str, attempts: int = 3) -> str:
+    """Fetch a page, retrying when the site blocks the request.
 
-    Blocks are intermittent (on GitHub's runners roughly every other request),
-    so a short randomised wait and another try usually gets through.
+    `marker` is a string only the real page contains; its absence means we got
+    a block page or the site changed. Blocks are intermittent (on GitHub's
+    runners roughly every other request), so a short randomised wait and
+    another try often gets through.
     """
     for attempt in range(1, attempts + 1):
         try:
-            return fetch_once(url)
+            return fetch_once(url, marker)
         except LayoutChanged:
             raise  # retrying won't fix a redesign
         except Blocked as e:
@@ -102,7 +135,7 @@ def fetch(url: str, attempts: int = 3) -> str:
     raise AssertionError("unreachable")
 
 
-def fetch_once(url: str, timeout: int = 30) -> str:
+def fetch_once(url: str, marker: str, timeout: int = 30) -> str:
     req = urllib.request.Request(
         url,
         headers={
@@ -115,19 +148,31 @@ def fetch_once(url: str, timeout: int = 30) -> str:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
-        # Amazon answers bots with 503 + a CAPTCHA page.
+        # Bots typically get 403/429/503 plus a challenge page.
         raise Blocked(f"HTTP {e.code} for {url}") from e
     except (urllib.error.URLError, TimeoutError) as e:
         raise Blocked(f"network error for {url}: {e}") from e
 
-    if 'id="productTitle"' in body:
+    if marker in body:
         return body
     lowered = body.lower()
     if "captcha" in lowered:
         raise Blocked(f"CAPTCHA page for {url}")
     if "bm-verify" in lowered or "/_sec/verify" in lowered:
         raise Blocked(f"bot-check challenge page for {url}")
-    raise LayoutChanged(f"no product title on {url}")
+    raise LayoutChanged(f"expected marker {marker!r} missing on {url}")
+
+
+def normalise(text: str) -> str:
+    """Lower-case and drop spaces so '512 GB' and '512GB' compare equal."""
+    return re.sub(r"\s+", "", text).lower()
+
+
+# --------------------------------------------------------------------------- #
+# Amazon
+# --------------------------------------------------------------------------- #
+
+AMAZON_MARKER = 'id="productTitle"'
 
 
 def parse_variants(page: str) -> dict[str, list[str]]:
@@ -135,11 +180,6 @@ def parse_variants(page: str) -> dict[str, list[str]]:
     if not m:
         raise LayoutChanged("variant table (dimensionValuesDisplayData) not found")
     return json.loads(m.group(1))
-
-
-def normalise(text: str) -> str:
-    """Lower-case and drop spaces so '512 GB' and '512GB' compare equal."""
-    return re.sub(r"\s+", "", text).lower()
 
 
 def find_variant(variants: dict[str, list[str]], terms: list[str]) -> str | None:
@@ -160,12 +200,12 @@ def text_of(page: str, element_id: str, limit: int = 2000) -> str:
     return html.unescape(re.sub(r"\s+", " ", stripped)).strip()
 
 
-def parse_product(page: str) -> tuple[str, str | None, bool, str]:
+def parse_amazon_product(page: str) -> tuple[str, int | None, bool, str]:
     title_m = re.search(r'id="productTitle"[^>]*>(.*?)</span>', page, re.S)
     title = html.unescape(re.sub(r"\s+", " ", title_m.group(1))).strip() if title_m else "?"
 
     price_m = re.search(r'a-price-whole">([\d,]+)', page)
-    price = f"₹{price_m.group(1)}" if price_m else None
+    price = int(price_m.group(1).replace(",", "")) if price_m else None
 
     availability = text_of(page, "availability", 400)[:120]
     unavailable = "currently unavailable" in availability.lower()
@@ -173,22 +213,96 @@ def parse_product(page: str) -> tuple[str, str | None, bool, str]:
     return title, price, buyable, availability
 
 
-def check(host: str, listing: str, terms: list[str]) -> Result:
-    listing_page = fetch(f"https://{host}/dp/{listing}?th=1")
+def check_amazon(host: str, listing: str, match: list[str]) -> Result:
+    listing_page = fetch(f"https://{host}/dp/{listing}?th=1", AMAZON_MARKER)
     variants = parse_variants(listing_page)
-    asin = find_variant(variants, terms)
+    asin = find_variant(variants, match)
     if asin is None:
-        return Result("not_listed", detail=f"{len(variants)} variants listed, none match")
+        return Result("not_listed", good=False, status_text="not listed yet",
+                      detail=f"{len(variants)} variants listed, none match")
 
-    product_page = fetch(f"https://{host}/dp/{asin}?th=1&psc=1")
-    title, price, buyable, availability = parse_product(product_page)
-    return Result(
-        "in_stock" if buyable else "out_of_stock",
-        asin=asin,
-        title=title,
-        price=price,
-        detail=availability or None,
-    )
+    url = f"https://{host}/dp/{asin}?th=1&psc=1"
+    title, price, buyable, availability = parse_amazon_product(fetch(url, AMAZON_MARKER))
+    if buyable:
+        return Result("in_stock", good=True, status_text="in stock",
+                      title=title, price=price, url=url, detail=availability or None)
+    return Result("out_of_stock", good=False, status_text="listed, not buyable yet",
+                  title=title, price=price, url=url, detail=availability or None)
+
+
+# --------------------------------------------------------------------------- #
+# Flipkart
+# --------------------------------------------------------------------------- #
+
+FLIPKART_MARKER = "application/ld+json"
+
+
+def parse_flipkart_product(page: str) -> tuple[str, int, bool]:
+    """Return (name, price in rupees, in stock) from the schema.org Product block."""
+    blocks = re.findall(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+                        page, re.S)
+    for block in blocks:
+        try:
+            data = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        for item in data if isinstance(data, list) else [data]:
+            if not (isinstance(item, dict) and item.get("@type") == "Product"):
+                continue
+            offers = item.get("offers") or {}
+            if isinstance(offers, list):
+                offers = offers[0] if offers else {}
+            if offers.get("price") is None:
+                raise LayoutChanged("schema.org Product has no offers.price")
+            in_stock = str(offers.get("availability", "")).endswith("/InStock")
+            return item.get("name", "?"), round(float(offers["price"])), in_stock
+    raise LayoutChanged("no schema.org Product data on the page")
+
+
+def check_flipkart(url: str, max_price: int) -> Result:
+    name, price, in_stock = parse_flipkart_product(fetch(url, FLIPKART_MARKER))
+    target = format_inr(max_price)
+    if not in_stock:
+        return Result("out_of_stock", good=False, status_text="sold out",
+                      title=name, price=price, url=url)
+    if price <= max_price:
+        return Result("at_target", good=True,
+                      status_text=f"at {format_inr(price)} (target {target})",
+                      title=name, price=price, url=url)
+    return Result("above_target", good=False, status_text=f"above your {target} target",
+                  title=name, price=price, url=url)
+
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+
+SITES = {"amazon": "Amazon", "flipkart": "Flipkart"}
+
+
+def build_target(entry: dict) -> Target:
+    site = entry["site"]
+    if site == "amazon":
+        host, listing, match = entry["host"], entry["listing"], entry["match"]
+
+        def check() -> Result:
+            return check_amazon(host, listing, match)
+    elif site == "flipkart":
+        url, max_price = entry["url"], int(entry["max_price"])
+
+        def check() -> Result:
+            return check_flipkart(url, max_price)
+    else:
+        raise ValueError(f"unknown site {site!r} in target {entry.get('key')!r}")
+    return Target(key=entry["key"], site=SITES[site], label=entry["label"], check=check)
+
+
+def load_targets(path: Path = CONFIG_FILE) -> list[Target]:
+    entries = json.loads(path.read_text())["targets"]
+    keys = [e["key"] for e in entries]
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"duplicate target keys in {path}")
+    return [build_target(e) for e in entries]
 
 
 # --------------------------------------------------------------------------- #
@@ -206,7 +320,7 @@ def notify_windows(title: str, body: str, url: str | None) -> bool:
         u = xml_escape(url, {'"': "&quot;"})
         launch = f' activationType="protocol" launch="{u}"'
         actions = (
-            f'<actions><action content="Open Amazon" activationType="protocol" '
+            f'<actions><action content="Open page" activationType="protocol" '
             f'arguments="{u}"/><action content="Dismiss" activationType="system" '
             f'arguments="dismiss"/></actions>'
         )
@@ -273,14 +387,28 @@ def notify(title: str, body: str, url: str | None = None) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# State and main
+# State
 # --------------------------------------------------------------------------- #
 
 def load_state() -> dict:
     try:
-        return json.loads(STATE_FILE.read_text())
+        state = json.loads(STATE_FILE.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        state = {}
+    return migrate_state(state)
+
+
+def migrate_state(state: dict) -> dict:
+    """Move single-product state (top-level keys) under its target key."""
+    if "targets" in state:
+        return state
+    legacy = {k: v for k, v in state.items() if k != "price"}  # price was a string
+    if not legacy:
+        return {"targets": {}}
+    # The old format had no "good" flag; in_stock was its only alert-worthy
+    # status. Without this, an item already in stock would alert again.
+    legacy["good"] = legacy.get("status") == "in_stock"
+    return {"targets": {LEGACY_TARGET_KEY: legacy}}
 
 
 def save_state(state: dict) -> None:
@@ -289,86 +417,106 @@ def save_state(state: dict) -> None:
     tmp.replace(STATE_FILE)  # atomic, so an interrupted run can't corrupt it
 
 
-def run(args: argparse.Namespace) -> int:
-    state = load_state()
-    label = " ".join(args.match)
+# --------------------------------------------------------------------------- #
+# Running checks
+# --------------------------------------------------------------------------- #
 
+def describe(result: Result) -> str:
+    price = format_inr(result.price) if result.price is not None else "price not shown"
+    return f"{price} - {result.title}" if result.title else price
+
+
+def check_target(target: Target, ts: dict) -> bool:
+    """Run one target's check, alert on changes, update its state. False if blocked."""
+    name = f"{target.site}: {target.label}"
     try:
-        result = check(args.host, args.listing, args.match)
+        result = target.check()
     except Blocked as e:
-        state["blocked_streak"] = state.get("blocked_streak", 0) + 1
-        state["blocked_since_heartbeat"] = state.get("blocked_since_heartbeat", 0) + 1
-        log.warning("blocked (%d in a row): %s", state["blocked_streak"], e)
+        ts["blocked_streak"] = ts.get("blocked_streak", 0) + 1
+        ts["blocked_since_heartbeat"] = ts.get("blocked_since_heartbeat", 0) + 1
+        log.warning("[%s] blocked (%d in a row): %s", target.key, ts["blocked_streak"], e)
 
         # A redesign won't fix itself, so it alerts sooner (2 runs in a row,
         # to ride out a one-off odd page) than ordinary blocks do.
         if isinstance(e, LayoutChanged):
-            state["layout_streak"] = state.get("layout_streak", 0) + 1
-            if state["layout_streak"] == LAYOUT_ALERT_AFTER:
-                notify("Amazon watcher needs updating",
-                       f"Amazon's page no longer looks the way watch.py expects ({e}). "
-                       f"Checks for {label} are not working until the parser is fixed.")
+            ts["layout_streak"] = ts.get("layout_streak", 0) + 1
+            if ts["layout_streak"] == LAYOUT_ALERT_AFTER:
+                notify(f"{target.site} watcher needs updating",
+                       f"{target.site}'s page no longer looks the way watch.py expects "
+                       f"({e}). Checks for {target.label} are not working until the "
+                       f"parser is fixed.")
         else:
-            state["layout_streak"] = 0
-            if state["blocked_streak"] == BLOCKED_ALERT_AFTER:
-                notify("Amazon watcher can't see the page",
+            ts["layout_streak"] = 0
+            if ts["blocked_streak"] == BLOCKED_ALERT_AFTER:
+                notify(f"{target.site} watcher can't see the page",
                        f"{BLOCKED_ALERT_AFTER} checks in a row were blocked ({e}). "
-                       f"Alerts for {label} may be missed; see watch.log.")
-        finish(args, state)
-        return 2
+                       f"Alerts for {target.label} may be missed; see watch.log.")
+        return False
 
-    if state.get("blocked_streak", 0) >= BLOCKED_ALERT_AFTER:
-        log.info("page readable again after %d blocked runs", state["blocked_streak"])
-    state["blocked_streak"] = 0
-    state["layout_streak"] = 0
-    state["ok_since_heartbeat"] = state.get("ok_since_heartbeat", 0) + 1
-    state["last_ok"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    if ts.get("blocked_streak", 0) >= BLOCKED_ALERT_AFTER:
+        log.info("[%s] page readable again after %d blocked runs",
+                 target.key, ts["blocked_streak"])
+    ts["blocked_streak"] = ts["layout_streak"] = 0
+    ts["ok_since_heartbeat"] = ts.get("ok_since_heartbeat", 0) + 1
+    ts["last_ok"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
-    previous = state.get("status")
-    log.info("status=%s asin=%s price=%s detail=%s",
-             result.status, result.asin, result.price, result.detail)
+    log.info("[%s] status=%s price=%s detail=%s",
+             target.key, result.status, result.price, result.detail)
 
-    url = f"https://{args.host}/dp/{result.asin}?th=1&psc=1" if result.asin else None
+    previous, was_good = ts.get("status"), ts.get("good", False)
     if result.status != previous:
-        if result.status == "in_stock":
-            notify(f"IN STOCK: {label}",
-                   f"{result.price or 'price not shown'} - {result.title}", url)
-        elif result.status == "out_of_stock" and previous in (None, "not_listed"):
-            notify(f"Listed, not buyable yet: {label}",
-                   f"{result.detail or 'Currently unavailable'} - {result.title}", url)
-        elif previous == "in_stock":
-            notify(f"Sold out again: {label}", result.detail or "No longer buyable", url)
+        if result.good and not was_good:
+            notify(f"{name} is {result.status_text}!", describe(result), result.url)
+        elif was_good and not result.good:
+            notify(f"{name} is now {result.status_text}", describe(result), result.url)
+        elif previous == "not_listed":
+            notify(f"{name} is {result.status_text}", describe(result), result.url)
 
-    state.update(status=result.status, asin=result.asin, price=result.price,
-                 last_check=time.strftime("%Y-%m-%d %H:%M:%S"))
-    finish(args, state)
-    return 0
+    ts.update(status=result.status, good=result.good, status_text=result.status_text,
+              price=result.price, url=result.url,
+              last_check=time.strftime("%Y-%m-%d %H:%M:%S"))
+    return True
 
 
-def finish(args: argparse.Namespace, state: dict) -> None:
-    """Send the daily heartbeat if requested, then persist state."""
+def send_heartbeat(targets: list[Target], state: dict) -> None:
+    """Quiet daily phone push summarising every target, then reset the counters."""
+    lines = []
+    for t in targets:
+        ts = state["targets"].get(t.key, {})
+        price = f" at {format_inr(ts['price'])}" if ts.get("price") is not None else ""
+        lines.append(
+            f"{t.site} {t.label}: {ts.get('status_text', 'unknown')}{price}. "
+            f"{ts.get('ok_since_heartbeat', 0)} checks ok, "
+            f"{ts.get('blocked_since_heartbeat', 0)} blocked, "
+            f"last good check {ts.get('last_ok', 'never')}.")
+        ts["ok_since_heartbeat"] = ts["blocked_since_heartbeat"] = 0
+    notify_ntfy("Watcher: still running", "\n".join(lines), None, priority="low")
+    log.info("heartbeat sent: %s", " | ".join(lines))
+
+
+def run(args: argparse.Namespace, targets: list[Target] | None = None) -> int:
+    """Check every target. Exit code 2 if any were blocked, else 0."""
+    if targets is None:
+        targets = load_targets()
+    if args.only:
+        targets = [t for t in targets if t.key in args.only]
+    state = load_state()
+
+    all_ok = True
+    for target in targets:
+        ts = state["targets"].setdefault(target.key, {})
+        all_ok &= check_target(target, ts)
+
     if args.heartbeat:
-        ok = state.get("ok_since_heartbeat", 0)
-        blocked = state.get("blocked_since_heartbeat", 0)
-        status = {"not_listed": "not listed yet", "out_of_stock": "listed, not buyable",
-                  "in_stock": "IN STOCK"}.get(state.get("status"), "unknown")
-        notify_ntfy(  # phone only: this is a quiet daily signal, not an alert
-            "Amazon watcher: still running",
-            f"{' '.join(args.match)}: {status}. Since last heartbeat: {ok} checks ok, "
-            f"{blocked} blocked. Last good check {state.get('last_ok', 'never')}.",
-            None, priority="low")
-        log.info("heartbeat sent (%d ok, %d blocked)", ok, blocked)
-        state["ok_since_heartbeat"] = state["blocked_since_heartbeat"] = 0
+        send_heartbeat(targets, state)
     save_state(state)
+    return 0 if all_ok else 2
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--host", default=DEFAULT_HOST)
-    p.add_argument("--listing", default=DEFAULT_LISTING,
-                   help="any ASIN from the product's listing page")
-    p.add_argument("--match", nargs="+", default=DEFAULT_MATCH,
-                   help="terms that must all appear in the variant's labels")
+    p.add_argument("--only", nargs="+", metavar="KEY",
+                   help="check only these target keys from targets.json")
     p.add_argument("--jitter", type=int, default=0,
                    help="sleep a random 0..N seconds first, so checks aren't clockwork")
     p.add_argument("--heartbeat", action="store_true",
@@ -385,8 +533,7 @@ def main() -> int:
     )
 
     if args.test_notify:
-        notify("Amazon watcher test", "Notifications are working.",
-               f"https://{args.host}/dp/{args.listing}")
+        notify("Watcher test", "Notifications are working.")
         return 0
 
     if args.jitter:
