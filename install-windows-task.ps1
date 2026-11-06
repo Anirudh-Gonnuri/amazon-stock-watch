@@ -8,16 +8,16 @@
 # Usage (from WSL):
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w install-windows-task.ps1)"
 # Remove with:
-#   Unregister-ScheduledTask -TaskName 'Amazon Stock Watch' -Confirm:$false
+#   Unregister-ScheduledTask -TaskName 'Price Watch' -Confirm:$false
 
 param(
     [string]$Distro = 'Ubuntu',
-    [string]$ScriptPath = '/home/anirudh/amazon-stock-watch/watch.py',
+    [string]$ScriptPath = '/home/anirudh/price-watch/watch.py',
     [int]$IntervalMinutes = 10
 )
 
 $ErrorActionPreference = 'Stop'
-$taskName = 'Amazon Stock Watch'
+$taskName = 'Price Watch'
 $user = "$env:USERDOMAIN\$env:USERNAME"  # tasks need the qualified name
 
 # conhost --headless runs the console program without flashing a window.
@@ -41,7 +41,7 @@ $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive
 
 Register-ScheduledTask -TaskName $taskName -Action $action `
     -Trigger $repeat, $logon -Settings $settings -Principal $principal `
-    -Description 'Checks Amazon for the S25 Ultra Whitesilver 512GB variant.' -Force |
+    -Description 'Runs price-watch (targets.json) in WSL.' -Force |
     Out-Null
 
 Write-Host "Registered '$taskName' (every $IntervalMinutes min)."
