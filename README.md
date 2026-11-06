@@ -82,5 +82,5 @@ Check one target by itself with `python3 watch.py --only <key>`.
 
 ## Stopping it
 
-- Local: `Unregister-ScheduledTask -TaskName 'Amazon Stock Watch' -Confirm:$false` (PowerShell)
+- Local: `Unregister-ScheduledTask -TaskName 'Price Watch' -Confirm:$false` (PowerShell)
 - GitHub: `gh workflow disable watch`
