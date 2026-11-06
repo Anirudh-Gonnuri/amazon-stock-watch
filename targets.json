@@ -1,0 +1,12 @@
+{
+  "targets": [
+    {
+      "key": "amazon-s25u-whitesilver-512",
+      "site": "amazon",
+      "label": "S25 Ultra Whitesilver 512GB",
+      "host": "www.amazon.in",
+      "listing": "B0DSKL9MQ8",
+      "match": ["512GB", "Whitesilver"]
+    }
+  ]
+}
