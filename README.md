@@ -17,8 +17,23 @@ on amazon.in (listing `B0DSKL9MQ8`).
 3. Notifies only when the status changes (listed / in stock / sold out again),
    using `state.json` to remember the last status.
 
-A CAPTCHA or unexpected page counts as **blocked**, not "unavailable". Blocked
-fetches are retried, and 6 blocked runs in a row send a warning.
+A CAPTCHA or unexpected page never counts as "unavailable". Instead:
+
+| Alert | Meaning |
+|---|---|
+| **IN STOCK** / **Listed, not buyable yet** / **Sold out again** | the variant's status changed |
+| **Amazon watcher can't see the page** | 6 runs in a row hit a CAPTCHA or bot check (blocked fetches are retried first) |
+| **Amazon watcher needs updating** | 2 runs in a row got a page without the expected markers: Amazon redesigned it and the parser needs fixing |
+| **Amazon watcher: still running** (low priority, 08:00 IST daily, GitHub only) | the schedule is alive; includes how many checks got through. If it stops arriving, check the Actions tab |
+
+## Known limits
+
+- Only variants on this listing are seen. A separate listing for the same
+  phone wouldn't be detected. Searching Amazon would catch it, but search is
+  behind a JavaScript bot challenge, and getting past that would mean
+  defeating Amazon's bot protection, which this project deliberately doesn't do.
+- GitHub disables schedules in repos with no commits for 60 days. The missing
+  daily heartbeat is the signal; re-enable it from the email or Actions tab.
 
 ## Where it runs
 
@@ -39,6 +54,7 @@ Each runner keeps its own state, so an event can alert once from each.
 - Local schedule, from WSL:
   `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w install-windows-task.ps1)"`
 - Test notifications: `python3 watch.py --test-notify`
+- Tests (offline): `python3 -m unittest -v`
 - Watch something else: `python3 watch.py --listing <ASIN> --match <term> <term>`
 
 ## Stopping it
