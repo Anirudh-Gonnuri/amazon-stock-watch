@@ -1,4 +1,4 @@
-# amazon-stock-watch
+# price-watch
 
 Alerts me when a product I'm waiting for becomes worth buying, on Amazon and
 Flipkart (India). What to watch lives in [`targets.json`](targets.json).
