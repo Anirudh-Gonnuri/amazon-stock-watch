@@ -1,0 +1,5 @@
+# Runtime files written by watch.py
+state.json
+state.tmp
+watch.log
+__pycache__/
