@@ -50,6 +50,7 @@ DEFAULT_HOST = "www.amazon.in"
 DEFAULT_LISTING = "B0DSKL9MQ8"  # Galaxy S25 Ultra listing the user is watching
 DEFAULT_MATCH = ["512GB", "Whitesilver"]
 BLOCKED_ALERT_AFTER = 6  # consecutive blocked runs before warning
+LAYOUT_ALERT_AFTER = 2   # consecutive "page redesigned" runs before warning
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -60,7 +61,11 @@ log = logging.getLogger("watch")
 
 
 class Blocked(Exception):
-    """Amazon returned something that is not a normal product page."""
+    """Amazon refused the request (CAPTCHA, bot check, error status)."""
+
+
+class LayoutChanged(Blocked):
+    """The page loaded but the markers we parse are missing: Amazon redesigned it."""
 
 
 @dataclass
@@ -85,6 +90,8 @@ def fetch(url: str, attempts: int = 3) -> str:
     for attempt in range(1, attempts + 1):
         try:
             return fetch_once(url)
+        except LayoutChanged:
+            raise  # retrying won't fix a redesign
         except Blocked as e:
             if attempt == attempts:
                 raise
@@ -113,18 +120,20 @@ def fetch_once(url: str, timeout: int = 30) -> str:
     except (urllib.error.URLError, TimeoutError) as e:
         raise Blocked(f"network error for {url}: {e}") from e
 
+    if 'id="productTitle"' in body:
+        return body
     lowered = body.lower()
-    if "captcha" in lowered and 'id="producttitle"' not in lowered:
+    if "captcha" in lowered:
         raise Blocked(f"CAPTCHA page for {url}")
-    if 'id="productTitle"' not in body:
-        raise Blocked(f"no product title on {url} (page layout changed or blocked)")
-    return body
+    if "bm-verify" in lowered or "/_sec/verify" in lowered:
+        raise Blocked(f"bot-check challenge page for {url}")
+    raise LayoutChanged(f"no product title on {url}")
 
 
 def parse_variants(page: str) -> dict[str, list[str]]:
     m = re.search(r'"dimensionValuesDisplayData"\s*:\s*(\{[^{}]*\})', page)
     if not m:
-        raise Blocked("variant table (dimensionValuesDisplayData) not found")
+        raise LayoutChanged("variant table (dimensionValuesDisplayData) not found")
     return json.loads(m.group(1))
 
 
@@ -229,7 +238,7 @@ $appId = '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\pow
     return True
 
 
-def notify_ntfy(title: str, body: str, url: str | None) -> bool:
+def notify_ntfy(title: str, body: str, url: str | None, priority: str = "urgent") -> bool:
     """Push to a phone via ntfy.sh.
 
     The topic name acts as the password for the channel, so it comes from the
@@ -242,7 +251,8 @@ def notify_ntfy(title: str, body: str, url: str | None) -> bool:
     if not topic:
         return False
     server = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
-    headers = {"Title": title.encode("utf-8"), "Priority": "urgent", "Tags": "rotating_light"}
+    headers = {"Title": title.encode("utf-8"), "Priority": priority,
+               "Tags": "rotating_light" if priority == "urgent" else "white_check_mark"}
     if url:
         headers["Click"] = url
     req = urllib.request.Request(
@@ -287,17 +297,32 @@ def run(args: argparse.Namespace) -> int:
         result = check(args.host, args.listing, args.match)
     except Blocked as e:
         state["blocked_streak"] = state.get("blocked_streak", 0) + 1
+        state["blocked_since_heartbeat"] = state.get("blocked_since_heartbeat", 0) + 1
         log.warning("blocked (%d in a row): %s", state["blocked_streak"], e)
-        if state["blocked_streak"] == BLOCKED_ALERT_AFTER:
-            notify("Amazon watcher can't see the page",
-                   f"{BLOCKED_ALERT_AFTER} checks in a row were blocked. "
-                   f"Alerts for {label} may be missed; see watch.log.")
-        save_state(state)
+
+        # A redesign won't fix itself, so it alerts sooner (2 runs in a row,
+        # to ride out a one-off odd page) than ordinary blocks do.
+        if isinstance(e, LayoutChanged):
+            state["layout_streak"] = state.get("layout_streak", 0) + 1
+            if state["layout_streak"] == LAYOUT_ALERT_AFTER:
+                notify("Amazon watcher needs updating",
+                       f"Amazon's page no longer looks the way watch.py expects ({e}). "
+                       f"Checks for {label} are not working until the parser is fixed.")
+        else:
+            state["layout_streak"] = 0
+            if state["blocked_streak"] == BLOCKED_ALERT_AFTER:
+                notify("Amazon watcher can't see the page",
+                       f"{BLOCKED_ALERT_AFTER} checks in a row were blocked ({e}). "
+                       f"Alerts for {label} may be missed; see watch.log.")
+        finish(args, state)
         return 2
 
     if state.get("blocked_streak", 0) >= BLOCKED_ALERT_AFTER:
         log.info("page readable again after %d blocked runs", state["blocked_streak"])
     state["blocked_streak"] = 0
+    state["layout_streak"] = 0
+    state["ok_since_heartbeat"] = state.get("ok_since_heartbeat", 0) + 1
+    state["last_ok"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
     previous = state.get("status")
     log.info("status=%s asin=%s price=%s detail=%s",
@@ -316,8 +341,25 @@ def run(args: argparse.Namespace) -> int:
 
     state.update(status=result.status, asin=result.asin, price=result.price,
                  last_check=time.strftime("%Y-%m-%d %H:%M:%S"))
-    save_state(state)
+    finish(args, state)
     return 0
+
+
+def finish(args: argparse.Namespace, state: dict) -> None:
+    """Send the daily heartbeat if requested, then persist state."""
+    if args.heartbeat:
+        ok = state.get("ok_since_heartbeat", 0)
+        blocked = state.get("blocked_since_heartbeat", 0)
+        status = {"not_listed": "not listed yet", "out_of_stock": "listed, not buyable",
+                  "in_stock": "IN STOCK"}.get(state.get("status"), "unknown")
+        notify_ntfy(  # phone only: this is a quiet daily signal, not an alert
+            "Amazon watcher: still running",
+            f"{' '.join(args.match)}: {status}. Since last heartbeat: {ok} checks ok, "
+            f"{blocked} blocked. Last good check {state.get('last_ok', 'never')}.",
+            None, priority="low")
+        log.info("heartbeat sent (%d ok, %d blocked)", ok, blocked)
+        state["ok_since_heartbeat"] = state["blocked_since_heartbeat"] = 0
+    save_state(state)
 
 
 def main() -> int:
@@ -329,6 +371,8 @@ def main() -> int:
                    help="terms that must all appear in the variant's labels")
     p.add_argument("--jitter", type=int, default=0,
                    help="sleep a random 0..N seconds first, so checks aren't clockwork")
+    p.add_argument("--heartbeat", action="store_true",
+                   help="after checking, push a low-priority 'still running' summary")
     p.add_argument("--test-notify", action="store_true",
                    help="send a test notification and exit")
     args = p.parse_args()
