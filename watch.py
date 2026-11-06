@@ -694,8 +694,8 @@ def cmd_list(args: argparse.Namespace) -> int:
     state = load_state()["targets"]
     for n, e in enumerate(entries, 1):
         ts = state.get(e["key"], {})
-        price = f" {format_inr(ts['price'])}" if ts.get("price") is not None else ""
-        last = (f"{ts.get('status_text', '?')}{price} (checked {ts['last_check']})"
+        price = f"{format_inr(ts['price'])}, " if ts.get("price") is not None else ""
+        last = (f"{price}{ts.get('status_text', '?')} (checked {ts['last_check']})"
                 if "last_check" in ts else "not checked yet")
         print(f"{n}. [{e['key']}] {SITES[e['site']]}: {e['label']}")
         print(f"   alert when {rule_text(e)}; last: {last}")
