@@ -50,6 +50,7 @@ DEFAULT_HOST = "www.amazon.in"
 DEFAULT_LISTING = "B0DSKL9MQ8"  # Galaxy S25 Ultra listing the user is watching
 DEFAULT_MATCH = ["512GB", "Whitesilver"]
 BLOCKED_ALERT_AFTER = 6  # consecutive blocked runs before warning
+LAYOUT_ALERT_AFTER = 2   # consecutive "page redesigned" runs before warning
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -296,16 +297,28 @@ def run(args: argparse.Namespace) -> int:
     except Blocked as e:
         state["blocked_streak"] = state.get("blocked_streak", 0) + 1
         log.warning("blocked (%d in a row): %s", state["blocked_streak"], e)
-        if state["blocked_streak"] == BLOCKED_ALERT_AFTER:
-            notify("Amazon watcher can't see the page",
-                   f"{BLOCKED_ALERT_AFTER} checks in a row were blocked. "
-                   f"Alerts for {label} may be missed; see watch.log.")
-        save_state(state)
+
+        # A redesign won't fix itself, so it alerts sooner (2 runs in a row,
+        # to ride out a one-off odd page) than ordinary blocks do.
+        if isinstance(e, LayoutChanged):
+            state["layout_streak"] = state.get("layout_streak", 0) + 1
+            if state["layout_streak"] == LAYOUT_ALERT_AFTER:
+                notify("Amazon watcher needs updating",
+                       f"Amazon's page no longer looks the way watch.py expects ({e}). "
+                       f"Checks for {label} are not working until the parser is fixed.")
+        else:
+            state["layout_streak"] = 0
+            if state["blocked_streak"] == BLOCKED_ALERT_AFTER:
+                notify("Amazon watcher can't see the page",
+                       f"{BLOCKED_ALERT_AFTER} checks in a row were blocked ({e}). "
+                       f"Alerts for {label} may be missed; see watch.log.")
+        finish(args, state)
         return 2
 
     if state.get("blocked_streak", 0) >= BLOCKED_ALERT_AFTER:
         log.info("page readable again after %d blocked runs", state["blocked_streak"])
     state["blocked_streak"] = 0
+    state["layout_streak"] = 0
 
     previous = state.get("status")
     log.info("status=%s asin=%s price=%s detail=%s",
@@ -324,8 +337,13 @@ def run(args: argparse.Namespace) -> int:
 
     state.update(status=result.status, asin=result.asin, price=result.price,
                  last_check=time.strftime("%Y-%m-%d %H:%M:%S"))
-    save_state(state)
+    finish(args, state)
     return 0
+
+
+def finish(args: argparse.Namespace, state: dict) -> None:
+    """Persist state at the end of a run."""
+    save_state(state)
 
 
 def main() -> int:

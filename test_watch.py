@@ -1,6 +1,9 @@
-"""Offline tests for watch.py's page parsing. Run: python3 -m unittest -v"""
+"""Offline tests for watch.py (parsing and alerting). Run: python3 -m unittest -v"""
 
+import argparse
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import watch
@@ -62,6 +65,45 @@ class VariantMatching(unittest.TestCase):
     def test_missing_variant_table_is_layout_change(self):
         with self.assertRaises(watch.LayoutChanged):
             watch.parse_variants('<span id="productTitle">x</span>')
+
+
+class Alerts(unittest.TestCase):
+    """run() should alert once per event, and at the right threshold."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.object(watch, "STATE_FILE", Path(tmp.name) / "state.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.args = argparse.Namespace(host="www.amazon.in", listing="B0DSKL9MQ8",
+                                       match=["512GB", "Whitesilver"], heartbeat=False)
+
+    def run_with(self, outcome, times=1):
+        """Run `times` checks that each return/raise `outcome`; collect alert titles."""
+        kwargs = {"side_effect": outcome} if isinstance(outcome, Exception) \
+            else {"return_value": outcome}
+        with mock.patch.object(watch, "check", **kwargs), \
+             mock.patch.object(watch, "notify") as notify:
+            for _ in range(times):
+                watch.run(self.args)
+        return [c.args[0] for c in notify.call_args_list]
+
+    def test_in_stock_alerts_once_not_every_run(self):
+        result = watch.Result("in_stock", asin="B0X", price="₹1,09,999", title="S25")
+        self.assertEqual(len(self.run_with(result, times=3)), 1)
+
+    def test_ordinary_blocks_alert_once_at_threshold(self):
+        alerts = self.run_with(watch.Blocked("CAPTCHA"), times=watch.BLOCKED_ALERT_AFTER + 3)
+        self.assertEqual(alerts, ["Amazon watcher can't see the page"])
+
+    def test_redesign_alerts_sooner_with_its_own_message(self):
+        alerts = self.run_with(watch.LayoutChanged("no title"),
+                               times=watch.LAYOUT_ALERT_AFTER)
+        self.assertEqual(alerts, ["Amazon watcher needs updating"])
+
+    def test_single_odd_page_does_not_alert(self):
+        self.assertEqual(self.run_with(watch.LayoutChanged("no title")), [])
 
 
 if __name__ == "__main__":
