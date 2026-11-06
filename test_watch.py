@@ -263,10 +263,12 @@ class Formatting(unittest.TestCase):
 
 
 class Config(unittest.TestCase):
-    def test_shipped_targets_json_loads(self):
-        targets = {t.key: t for t in watch.load_targets()}
-        self.assertIn(watch.LEGACY_TARGET_KEY, targets)
-        self.assertEqual(targets["flipkart-s25u-whitesilver-512"].site, "Flipkart")
+    def test_example_config_loads_every_kind_of_target(self):
+        targets = watch.load_targets(watch.HERE / "targets.example.json")
+        self.assertEqual([t.site for t in targets], ["Flipkart", "Amazon", "Amazon"])
+
+    def test_missing_config_means_nothing_to_watch(self):
+        self.assertEqual(watch.load_entries(watch.HERE / "no-such-file.json"), [])
 
     def test_unknown_site_rejected(self):
         with self.assertRaises(ValueError):
