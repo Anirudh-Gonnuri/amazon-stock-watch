@@ -75,7 +75,26 @@ class Result:
 # Fetching and parsing
 # --------------------------------------------------------------------------- #
 
-def fetch(url: str, timeout: int = 30) -> str:
+def fetch(url: str, attempts: int = 3) -> str:
+    """Fetch a product page, retrying when Amazon blocks the request.
+
+    Blocks are intermittent (on GitHub's runners roughly every other request),
+    so a short randomised wait and another try usually gets through.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch_once(url)
+        except Blocked as e:
+            if attempt == attempts:
+                raise
+            wait = random.uniform(20, 40)
+            log.info("attempt %d/%d blocked (%s); retrying in %.0fs",
+                     attempt, attempts, e, wait)
+            time.sleep(wait)
+    raise AssertionError("unreachable")
+
+
+def fetch_once(url: str, timeout: int = 30) -> str:
     req = urllib.request.Request(
         url,
         headers={
