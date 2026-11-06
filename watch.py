@@ -44,6 +44,7 @@ from xml.sax.saxutils import escape as xml_escape
 HERE = Path(__file__).resolve().parent
 STATE_FILE = HERE / "state.json"
 LOG_FILE = HERE / "watch.log"
+NTFY_TOPIC_FILE = HERE / "ntfy_topic.txt"  # git-ignored; see notify_ntfy
 
 DEFAULT_HOST = "www.amazon.in"
 DEFAULT_LISTING = "B0DSKL9MQ8"  # Galaxy S25 Ultra listing the user is watching
@@ -229,8 +230,15 @@ $appId = '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\pow
 
 
 def notify_ntfy(title: str, body: str, url: str | None) -> bool:
-    """Push to a phone via ntfy.sh if NTFY_TOPIC is set (needed when run in the cloud)."""
+    """Push to a phone via ntfy.sh.
+
+    The topic name acts as the password for the channel, so it comes from the
+    NTFY_TOPIC env var (a GitHub secret in CI) or a git-ignored local file,
+    never from the source.
+    """
     topic = os.environ.get("NTFY_TOPIC")
+    if not topic and NTFY_TOPIC_FILE.exists():
+        topic = NTFY_TOPIC_FILE.read_text().strip()
     if not topic:
         return False
     server = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
