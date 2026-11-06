@@ -60,7 +60,11 @@ log = logging.getLogger("watch")
 
 
 class Blocked(Exception):
-    """Amazon returned something that is not a normal product page."""
+    """Amazon refused the request (CAPTCHA, bot check, error status)."""
+
+
+class LayoutChanged(Blocked):
+    """The page loaded but the markers we parse are missing: Amazon redesigned it."""
 
 
 @dataclass
@@ -85,6 +89,8 @@ def fetch(url: str, attempts: int = 3) -> str:
     for attempt in range(1, attempts + 1):
         try:
             return fetch_once(url)
+        except LayoutChanged:
+            raise  # retrying won't fix a redesign
         except Blocked as e:
             if attempt == attempts:
                 raise
@@ -113,18 +119,20 @@ def fetch_once(url: str, timeout: int = 30) -> str:
     except (urllib.error.URLError, TimeoutError) as e:
         raise Blocked(f"network error for {url}: {e}") from e
 
+    if 'id="productTitle"' in body:
+        return body
     lowered = body.lower()
-    if "captcha" in lowered and 'id="producttitle"' not in lowered:
+    if "captcha" in lowered:
         raise Blocked(f"CAPTCHA page for {url}")
-    if 'id="productTitle"' not in body:
-        raise Blocked(f"no product title on {url} (page layout changed or blocked)")
-    return body
+    if "bm-verify" in lowered or "/_sec/verify" in lowered:
+        raise Blocked(f"bot-check challenge page for {url}")
+    raise LayoutChanged(f"no product title on {url}")
 
 
 def parse_variants(page: str) -> dict[str, list[str]]:
     m = re.search(r'"dimensionValuesDisplayData"\s*:\s*(\{[^{}]*\})', page)
     if not m:
-        raise Blocked("variant table (dimensionValuesDisplayData) not found")
+        raise LayoutChanged("variant table (dimensionValuesDisplayData) not found")
     return json.loads(m.group(1))
 
 
