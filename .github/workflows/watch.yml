@@ -15,6 +15,7 @@ on:
   push:
     paths:
       - watch.py
+      - targets.json
       - .github/workflows/watch.yml
 
 # Never let two checks overlap; they'd race on the saved state.
