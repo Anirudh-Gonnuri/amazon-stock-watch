@@ -739,10 +739,17 @@ def set_schedules(enabled: bool) -> int:
     else:
         print("  Laptop task: skipped (not running under WSL)")
     if shutil.which("gh"):
-        proc = subprocess.run(["gh", "workflow", verb.lower(), "watch"],
-                              capture_output=True, text=True, cwd=HERE)
-        ok &= proc.returncode == 0
-        print(f"  GitHub schedule: {'ok' if proc.returncode == 0 else 'FAILED ' + proc.stderr.strip()[:150]}")
+        # gh only finds workflows in the opposite state, so check before toggling.
+        listing = subprocess.run(["gh", "workflow", "list", "--all", "--json", "name,state"],
+                                 capture_output=True, text=True, cwd=HERE)
+        states = {w["name"]: w["state"] for w in json.loads(listing.stdout or "[]")}
+        if (states.get("watch") == "active") == enabled:
+            print(f"  GitHub schedule: already {'on' if enabled else 'paused'}")
+        else:
+            proc = subprocess.run(["gh", "workflow", verb.lower(), "watch"],
+                                  capture_output=True, text=True, cwd=HERE)
+            ok &= proc.returncode == 0
+            print(f"  GitHub schedule: {'ok' if proc.returncode == 0 else 'FAILED ' + proc.stderr.strip()[:150]}")
     else:
         print("  GitHub schedule: skipped (gh CLI not found)")
     return 0 if ok else 1
